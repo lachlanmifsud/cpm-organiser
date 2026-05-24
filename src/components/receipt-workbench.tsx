@@ -1,14 +1,16 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import { toast } from "sonner";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ProcessingOverlay } from "@/components/processing-overlay";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   getActiveJobs,
   syncReceiptToJobs,
+  type SyncReceiptInput,
   type SyncReceiptItem,
 } from "@/lib/firebase/repository";
 import { JobFileRecord } from "@/types/database";
@@ -16,6 +18,12 @@ import {
   extractReceiptClient,
   type ExtractedReceiptItem,
 } from "@/lib/ai/extract-receipt-client";
+import {
+  coerceNumberInputValue,
+  formatNumberInputValue,
+  parseNumberInputChange,
+  type NumberInputValue,
+} from "@/lib/number-input";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,29 +32,62 @@ import {
 interface WorkbenchItem {
   tempId: string;
   description: string;
-  quantity: number;
-  unitPriceIncGst: number;
+  rawDescription: string;
+  quantity: NumberInputValue;
+  unitPriceIncGst: NumberInputValue;
   targetJobId: string;
-  excluded: boolean;
   isManual: boolean;
 }
 
 interface ReceiptWorkbenchProps {
   receipt: JobFileRecord;
+  /** Local file from the uploader — preferred for AI extraction (bytes never go through Storage fetch). */
+  sourceImageFile?: File | null;
   currentJobId: string;
   onClose: () => void;
   onSynced: () => void;
+  autoStart?: boolean;
+  onExtractionComplete?: () => void;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function toDollars(cents: number) {
-  return new Intl.NumberFormat("en-AU", {
-    style: "currency",
-    currency: "AUD",
-  }).format(cents / 100);
+type HeaderDraft = {
+  vendorName: string;
+  receiptDate: string;
+  totalGstDollars: string;
+  totalAmountDollars: string;
+};
+
+function emptyHeaderDraft(): HeaderDraft {
+  return {
+    vendorName: "",
+    receiptDate: "",
+    totalGstDollars: "",
+    totalAmountDollars: "",
+  };
+}
+
+/** Parse AUD currency text to whole cents; empty → null. */
+function parseAudToCents(value: string): number | null {
+  const t = value.trim().replace(/\$/g, "").replace(/,/g, "");
+  if (t === "") {
+    return null;
+  }
+  const n = Number.parseFloat(t);
+  if (!Number.isFinite(n) || n < 0) {
+    return null;
+  }
+  return Math.round(n * 100);
+}
+
+function sumExtractedItemsCents(items: ExtractedReceiptItem[]): number {
+  return items.reduce((sum, row) => {
+    const sub = row.subtotalCents ?? Math.round(row.quantity * row.unitPriceCents);
+    return sum + sub;
+  }, 0);
 }
 
 let tempIdCounter = 0;
@@ -62,10 +103,10 @@ function fromExtractionItems(
   return items.map((item) => ({
     tempId: makeTempId(),
     description: item.description,
+    rawDescription: item.rawDescription || item.description,
     quantity: item.quantity ?? 1,
     unitPriceIncGst: item.unitPriceCents / 100,
     targetJobId: currentJobId,
-    excluded: false,
     isManual: false,
   }));
 }
@@ -74,19 +115,36 @@ function fromExtractionItems(
 // Component
 // ---------------------------------------------------------------------------
 
+async function resolveReceiptImageForExtraction(
+  receipt: JobFileRecord,
+  sourceImageFile?: File | null,
+): Promise<{ file: File | Blob; mimeTypeFallback?: string }> {
+  if (sourceImageFile && sourceImageFile.size > 0) {
+    return { file: sourceImageFile, mimeTypeFallback: receipt.mimeType };
+  }
+
+  const res = await fetch(receipt.downloadUrl, { mode: "cors" });
+  if (!res.ok) {
+    throw new Error(
+      "Could not load the receipt image. Try uploading the receipt again, or open it from a fresh upload.",
+    );
+  }
+  const blob = await res.blob();
+  return { file: blob, mimeTypeFallback: receipt.mimeType };
+}
+
 export function ReceiptWorkbench({
   receipt,
+  sourceImageFile = null,
   currentJobId,
   onClose,
   onSynced,
+  autoStart = false,
+  onExtractionComplete,
 }: ReceiptWorkbenchProps) {
   const queryClient = useQueryClient();
   const [scanState, setScanState] = useState<"idle" | "scanning" | "done" | "error">("idle");
-  const [extractedMeta, setExtractedMeta] = useState<{
-    vendorName: string | null;
-    date: string | null;
-    totalGst: number | null;
-  } | null>(null);
+  const [headerDraft, setHeaderDraft] = useState<HeaderDraft>(emptyHeaderDraft);
   const [items, setItems] = useState<WorkbenchItem[]>([]);
   const [scanError, setScanError] = useState<string | null>(null);
 
@@ -96,11 +154,7 @@ export function ReceiptWorkbench({
   });
 
   const syncMutation = useMutation({
-    mutationFn: (syncItems: SyncReceiptItem[]) =>
-      syncReceiptToJobs({
-        items: syncItems,
-        sourceReceiptFileId: receipt.id,
-      }),
+    mutationFn: (input: SyncReceiptInput) => syncReceiptToJobs(input),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["line-items"] });
       await queryClient.invalidateQueries({ queryKey: ["job-files"] });
@@ -117,29 +171,48 @@ export function ReceiptWorkbench({
   // ---------------------------------------------------------------------------
 
   const runExtraction = async () => {
+    console.log("[ReceiptWorkbench] AI extraction started for receipt:", receipt.name, receipt.id);
     setScanState("scanning");
     setScanError(null);
+    setHeaderDraft(emptyHeaderDraft());
 
     try {
+      const { file, mimeTypeFallback } = await resolveReceiptImageForExtraction(receipt, sourceImageFile);
       const data = await extractReceiptClient({
-        imageUrl: receipt.downloadUrl,
-        mimeType: receipt.mimeType,
+        file,
+        mimeTypeFallback,
       });
 
-      setExtractedMeta({
-        vendorName: null,
-        date: null,
-        totalGst: null,
+      console.log("[ReceiptWorkbench] AI extraction completed", data);
+      const sumCents = sumExtractedItemsCents(data.items);
+      const isoDate =
+        data.receiptDate && /^\d{4}-\d{2}-\d{2}$/.test(data.receiptDate) ? data.receiptDate : "";
+      setHeaderDraft({
+        vendorName: (data.vendorName ?? "").trim(),
+        receiptDate: isoDate,
+        totalGstDollars:
+          data.totalGstCents != null && Number.isFinite(data.totalGstCents)
+            ? (data.totalGstCents / 100).toFixed(2)
+            : "",
+        totalAmountDollars: (sumCents / 100).toFixed(2),
       });
       setItems(fromExtractionItems(data.items, currentJobId));
       setScanState("done");
+      onExtractionComplete?.();
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Could not read receipt clearly. Please enter details manually.";
+      console.error("[ReceiptWorkbench] AI extraction failed", err);
       setScanError(message);
       setScanState("error");
     }
   };
+
+  useEffect(() => {
+    if (autoStart && scanState === "idle") {
+      runExtraction();
+    }
+  }, [autoStart, scanState]);
 
   // ---------------------------------------------------------------------------
   // Item Mutations
@@ -161,10 +234,10 @@ export function ReceiptWorkbench({
       {
         tempId: makeTempId(),
         description: "",
+        rawDescription: "",
         quantity: 1,
-        unitPriceIncGst: 0,
+        unitPriceIncGst: "",
         targetJobId: currentJobId,
-        excluded: false,
         isManual: true,
       },
     ]);
@@ -174,18 +247,63 @@ export function ReceiptWorkbench({
   // Sync
   // ---------------------------------------------------------------------------
 
-  const includedItems = useMemo(() => items.filter((item) => !item.excluded), [items]);
-
   const handleSync = () => {
+    const lineSnapshots = items.map((item) => {
+      const quantity = coerceNumberInputValue(item.quantity, 0);
+      const unitPriceIncGst = coerceNumberInputValue(item.unitPriceIncGst, 0);
+      const unitPriceCents = Math.round(unitPriceIncGst * 100);
+      const subtotalCents = Math.round(quantity * unitPriceCents);
+      return {
+        description: item.description,
+        rawDescription: item.rawDescription.trim() || item.description,
+        quantity,
+        unitPriceCents,
+        subtotalCents,
+      };
+    });
+    const lineSumCents = lineSnapshots.reduce((sum, row) => sum + row.subtotalCents, 0);
+
+    let totalGstCents: number | null = null;
+    if (headerDraft.totalGstDollars.trim() !== "") {
+      const g = parseAudToCents(headerDraft.totalGstDollars);
+      if (g === null) {
+        toast.error("GST is not a valid amount. Use dollars, e.g. 12.50");
+        return;
+      }
+      totalGstCents = g;
+    }
+
+    let totalAmountCents = lineSumCents;
+    if (headerDraft.totalAmountDollars.trim() !== "") {
+      const t = parseAudToCents(headerDraft.totalAmountDollars);
+      if (t === null) {
+        toast.error("Total is not a valid amount. Use dollars, e.g. 145.00");
+        return;
+      }
+      totalAmountCents = t;
+    }
+
     const syncItems: SyncReceiptItem[] = items.map((item) => ({
       description: item.description,
-      quantity: item.quantity,
-      unitPriceIncGst: item.unitPriceIncGst,
+      rawDescription: item.rawDescription.trim() || undefined,
+      quantity: coerceNumberInputValue(item.quantity, 0),
+      unitPriceIncGst: coerceNumberInputValue(item.unitPriceIncGst, 0),
       targetJobId: item.targetJobId,
       receiptFileId: receipt.id,
-      excluded: item.excluded,
     }));
-    syncMutation.mutate(syncItems);
+
+    const payload: SyncReceiptInput = {
+      items: syncItems,
+      sourceReceiptFileId: receipt.id,
+      receiptStashMeta: {
+        vendorName: headerDraft.vendorName.trim() || null,
+        receiptDate: headerDraft.receiptDate.trim() || null,
+        totalGstCents,
+        totalAmountCents,
+        lineSnapshots,
+      },
+    };
+    syncMutation.mutate(payload);
   };
 
   // ---------------------------------------------------------------------------
@@ -193,122 +311,150 @@ export function ReceiptWorkbench({
   // ---------------------------------------------------------------------------
 
   return (
-    // Backdrop
     <div
-      className="fixed inset-0 z-50 flex items-end justify-end bg-black/60 sm:items-stretch"
+      className="fixed inset-0 z-[9999] flex items-end justify-end bg-[#323338]/60 backdrop-blur-sm sm:items-stretch"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      {/* Drawer panel */}
-      <div className="flex h-full w-full flex-col overflow-hidden bg-zinc-900 sm:w-[92vw] lg:w-[80vw] xl:w-[70vw]">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-zinc-700 px-5 py-4">
-          <div>
-            <h2 className="text-xl font-bold">Receipt Workbench</h2>
-            <p className="text-sm text-zinc-400">{receipt.name}</p>
+      <div
+        className="relative z-[9999] flex h-full max-h-[100dvh] w-full flex-col overflow-hidden border-l border-[#E6E9EF] bg-white shadow-[0_8px_30px_rgb(0,0,0,0.12)] sm:max-h-[min(100dvh,900px)] sm:rounded-t-lg lg:ml-auto lg:max-w-6xl lg:rounded-l-lg lg:rounded-tr-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex shrink-0 items-center justify-between border-b border-[#E6E9EF] bg-[#F5F6F8] px-4 py-3">
+          <div className="min-w-0 pr-2">
+            <h2 className="truncate text-lg font-semibold text-[#323338]">Receipt Workbench</h2>
+            <p className="truncate text-sm text-[#676879]">{receipt.name}</p>
           </div>
           <button
             onClick={onClose}
-            className="flex h-10 w-10 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            className="rounded-md p-1 text-[#676879] transition-colors duration-150 hover:bg-[#E6E9EF] hover:text-[#323338]"
             aria-label="Close"
           >
             ✕
           </button>
         </div>
 
-        {/* Body — two-column layout */}
-        <div className="flex flex-1 flex-col overflow-hidden lg:flex-row">
-          {/* Left — receipt image */}
-          <div className="flex flex-col border-b border-zinc-700 bg-zinc-950 p-4 lg:w-[42%] lg:border-b-0 lg:border-r lg:overflow-y-auto">
-            <p className="mb-3 text-sm font-medium uppercase tracking-widest text-zinc-400">
-              Receipt Image
-            </p>
-            <div className="relative flex-1 overflow-hidden rounded-xl border border-zinc-700">
+        <div className="grid min-h-0 flex-1 grid-rows-[auto_1fr] overflow-hidden lg:grid-cols-[minmax(200px,260px)_1fr] lg:grid-rows-1">
+          <div className="flex shrink-0 flex-col gap-3 border-b border-[#E6E9EF] bg-[#F0F4F8] p-4 lg:border-b-0 lg:border-r lg:border-[#E6E9EF]">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-[#676879]">Receipt</p>
+            <div className="relative mx-auto aspect-[3/4] w-full max-w-[200px] overflow-hidden rounded-md border border-[#D0D4E4] bg-white p-1 shadow-sm sm:max-w-[220px] lg:max-w-none">
               <Image
                 src={receipt.downloadUrl}
                 alt={receipt.name}
                 fill
                 unoptimized
-                className="object-contain"
+                sizes="(max-width: 1024px) 220px, 260px"
+                className="rounded object-contain"
               />
             </div>
 
             {scanState === "idle" && (
-              <Button className="mt-4 h-12 w-full text-base" onClick={runExtraction}>
+              <Button
+                className="h-9 w-full text-sm transition-all duration-300 ease-out active:scale-[0.97] hover:shadow-monday-1"
+                onClick={runExtraction}
+              >
                 Process with AI
               </Button>
             )}
 
-            {scanState === "scanning" && (
-              <div className="mt-4 space-y-2">
-                <div className="h-10 w-full animate-pulse rounded-lg bg-zinc-700" />
-                <div className="h-6 w-3/4 animate-pulse rounded-lg bg-zinc-800" />
-                <p className="text-center text-sm text-zinc-400">Scanning receipt…</p>
-              </div>
-            )}
-
             {scanState === "error" && (
-              <div className="mt-4 rounded-xl border border-red-700 bg-red-950/50 p-4">
-                <p className="text-sm font-semibold text-red-300">Extraction Failed</p>
-                <p className="mt-1 text-sm text-red-400">{scanError}</p>
+              <div className="rounded-lg border border-[#E2445C]/30 bg-[#FCECEE] p-3">
+                <p className="text-xs font-semibold text-[#E2445C]">Extraction failed</p>
+                <p className="mt-1 line-clamp-4 text-[11px] text-[#676879]">{scanError}</p>
                 <Button
                   variant="secondary"
-                  className="mt-3 h-10 w-full"
+                  className="mt-2 h-8 w-full text-xs"
                   onClick={() => {
                     setScanState("idle");
                     setScanError(null);
                     addManualItem();
                   }}
                 >
-                  Enter Details Manually
+                  Enter manually
                 </Button>
               </div>
             )}
           </div>
 
-          {/* Right — extracted data */}
-          <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex-1 overflow-y-auto px-5 py-4">
-              {/* Meta summary */}
-              {extractedMeta && (
-                <div className="mb-4 grid grid-cols-3 gap-3 rounded-xl border border-zinc-700 bg-zinc-950 p-3 text-sm">
-                  <div>
-                    <p className="text-zinc-400">Vendor</p>
-                    <p className="font-semibold text-zinc-100">
-                      {extractedMeta.vendorName ?? "—"}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-zinc-400">Date</p>
-                    <p className="font-semibold text-zinc-100">{extractedMeta.date ?? "—"}</p>
-                  </div>
-                  <div>
-                    <p className="text-zinc-400">Total GST</p>
-                    <p className="font-semibold text-zinc-100">
-                      {extractedMeta.totalGst != null
-                        ? toDollars(Math.round(extractedMeta.totalGst * 100))
-                        : "—"}
-                    </p>
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden border-l border-[#E6E9EF] bg-white">
+            <ProcessingOverlay
+              active={scanState === "scanning"}
+              title="Analyzing receipt lines with AI..."
+            />
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+              {scanState !== "scanning" &&
+              (scanState === "done" || scanState === "error" || items.length > 0) ? (
+                <div className="mb-4 rounded-lg border border-[#E6E9EF] bg-white p-4">
+                  <p className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-[#676879]">
+                    Receipt summary
+                  </p>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="sm:col-span-2">
+                      <label className={WORKBENCH_LABEL_CLASS}>Vendor</label>
+                      <Input
+                        value={headerDraft.vendorName}
+                        onChange={(e) =>
+                          setHeaderDraft((h) => ({ ...h, vendorName: e.target.value }))
+                        }
+                        placeholder="Supplier name"
+                        className={WORKBENCH_INPUT_CLASS}
+                      />
+                    </div>
+                    <div>
+                      <label className={WORKBENCH_LABEL_CLASS}>Invoice date</label>
+                      <Input
+                        type="date"
+                        value={headerDraft.receiptDate}
+                        onChange={(e) =>
+                          setHeaderDraft((h) => ({ ...h, receiptDate: e.target.value }))
+                        }
+                        className={WORKBENCH_INPUT_CLASS}
+                      />
+                    </div>
+                    <div>
+                      <label className={WORKBENCH_LABEL_CLASS}>Total (AUD inc GST)</label>
+                      <Input
+                        inputMode="decimal"
+                        value={headerDraft.totalAmountDollars}
+                        onChange={(e) =>
+                          setHeaderDraft((h) => ({ ...h, totalAmountDollars: e.target.value }))
+                        }
+                        placeholder="e.g. 145.00"
+                        className={`${WORKBENCH_INPUT_CLASS} tabular-nums`}
+                      />
+                      <p className="mt-1 text-[11px] text-[#676879]">
+                        Leave blank to use the sum of line items below.
+                      </p>
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className={WORKBENCH_LABEL_CLASS}>Total GST (AUD)</label>
+                      <Input
+                        inputMode="decimal"
+                        value={headerDraft.totalGstDollars}
+                        onChange={(e) =>
+                          setHeaderDraft((h) => ({ ...h, totalGstDollars: e.target.value }))
+                        }
+                        placeholder="e.g. 12.50"
+                        className={`${WORKBENCH_INPUT_CLASS} tabular-nums`}
+                      />
+                    </div>
                   </div>
                 </div>
-              )}
+              ) : null}
 
               {/* Scanning skeletons */}
               {scanState === "scanning" && (
-                <div className="space-y-3">
-                  {Array.from({ length: 4 }).map((_, i) => (
-                    <div
-                      key={i}
-                      className="h-20 w-full animate-pulse rounded-xl bg-zinc-800"
-                    />
+                <div className="space-y-2">
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <div key={i} className="h-14 w-full animate-pulse rounded-lg bg-[#F5F6F8]" />
                   ))}
                 </div>
               )}
 
               {/* Items list */}
               {(scanState === "done" || scanState === "error" || items.length > 0) && (
-                <div className="space-y-3">
+                <div>
                   {items.map((item) => (
                     <WorkbenchItemRow
                       key={item.tempId}
@@ -327,20 +473,19 @@ export function ReceiptWorkbench({
 
               {/* Empty state after scan */}
               {scanState === "done" && items.length === 0 && (
-                <p className="py-8 text-center text-zinc-400">
+                <p className="py-6 text-center text-sm text-[#676879]">
                   No line items detected. Add them manually below.
                 </p>
               )}
 
               {/* Idle state */}
               {scanState === "idle" && items.length === 0 && (
-                <div className="flex h-full flex-col items-center justify-center gap-4 py-16 text-center">
-                  <p className="text-zinc-400">
-                    Click <strong>&quot;Process with AI&quot;</strong> to extract line items automatically,
-                    or add items manually.
+                <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
+                  <p className="max-w-sm text-sm text-[#676879]">
+                    Use <strong>Process with AI</strong> on the receipt, or add items manually.
                   </p>
-                  <Button variant="secondary" className="h-11 px-5" onClick={addManualItem}>
-                    + Add Item Manually
+                  <Button variant="secondary" className="h-9 px-4 text-sm" onClick={addManualItem}>
+                    + Add item
                   </Button>
                 </div>
               )}
@@ -348,26 +493,25 @@ export function ReceiptWorkbench({
 
             {/* Footer actions */}
             {(scanState === "done" || items.length > 0) && (
-              <div className="border-t border-zinc-700 bg-zinc-900 px-5 py-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <Button
-                    variant="secondary"
-                    className="h-11 px-5"
-                    onClick={addManualItem}
-                  >
-                    + Add Item Manually
-                  </Button>
+              <div className="flex shrink-0 items-center justify-between border-t border-[#E6E9EF] bg-white p-4">
+                <button
+                  type="button"
+                  onClick={addManualItem}
+                  className="rounded-md border border-[#C3C6D4] bg-white px-4 py-2 font-medium text-[#323338] transition-colors duration-150 hover:bg-[#F5F6F8]"
+                >
+                  + Add item
+                </button>
 
-                  <Button
-                    className="h-12 px-6 text-base"
-                    disabled={includedItems.length === 0 || syncMutation.isPending}
-                    onClick={handleSync}
-                  >
-                    {syncMutation.isPending
-                      ? "Syncing…"
-                      : `Sync ${includedItems.length} Item${includedItems.length === 1 ? "" : "s"} to Jobs`}
-                  </Button>
-                </div>
+                <button
+                  type="button"
+                  disabled={items.length === 0 || syncMutation.isPending}
+                  onClick={handleSync}
+                  className="rounded-md bg-[#0073EA] px-5 py-2 font-medium text-white shadow-sm transition-all duration-150 hover:bg-[#0060B9] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {syncMutation.isPending
+                    ? "Syncing…"
+                    : `Sync ${items.length} item${items.length === 1 ? "" : "s"}`}
+                </button>
               </div>
             )}
           </div>
@@ -376,6 +520,16 @@ export function ReceiptWorkbench({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Presentation tokens
+// ---------------------------------------------------------------------------
+
+const WORKBENCH_LABEL_CLASS =
+  "mb-1 block text-[11px] font-semibold uppercase tracking-wider text-[#676879]";
+
+const WORKBENCH_INPUT_CLASS =
+  "h-8 border border-[#C3C6D4] bg-white text-sm text-[#323338] focus:border-[#0073EA] focus:ring-1 focus:ring-[#0073EA] focus:outline-none transition-all";
 
 // ---------------------------------------------------------------------------
 // WorkbenchItemRow
@@ -405,102 +559,73 @@ function WorkbenchItemRow({
   }, [activeJobs, currentJobId]);
 
   return (
-    <div
-      className={`rounded-xl border p-4 transition ${
-        item.excluded
-          ? "border-zinc-800 bg-zinc-950/50 opacity-50"
-          : "border-zinc-700 bg-zinc-800/50"
-      }`}
-    >
-      <div className="flex items-start gap-3">
-        {/* Exclude checkbox */}
-        <div className="mt-1 flex-shrink-0">
-          <input
-            type="checkbox"
-            id={`exclude-${item.tempId}`}
-            checked={item.excluded}
-            onChange={(e) => onChange({ excluded: e.target.checked })}
-            className="h-5 w-5 cursor-pointer rounded accent-zinc-400"
-            title="Exclude from invoice"
-          />
-        </div>
+    <div className="mb-3 rounded-lg border border-[#E6E9EF] bg-white p-4 transition-all duration-200 hover:border-[#C3C6D4] hover:shadow-sm">
+      <div className="flex gap-2">
+        <div className="min-w-0 flex-1 space-y-2">
+          {!item.isManual && item.rawDescription.trim() !== "" && (
+            <p
+              className="line-clamp-2 max-h-10 overflow-hidden font-mono text-xs uppercase leading-snug text-[#676879]"
+              title={item.rawDescription}
+            >
+              {item.rawDescription}
+            </p>
+          )}
 
-        <div className="flex-1 space-y-3">
-          {/* Description */}
           <Input
             value={item.description}
-            placeholder="Item description"
+            placeholder="Item title"
             onChange={(e) => onChange({ description: e.target.value })}
-            disabled={item.excluded}
-            className="h-11 text-base"
+            className={WORKBENCH_INPUT_CLASS}
           />
 
-          <div className="grid grid-cols-2 gap-3">
-            {/* Quantity */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-[4.5rem_5.5rem_1fr] sm:items-end">
             <div>
-              <label className="mb-1 block text-xs text-zinc-400">Qty</label>
+              <label className={WORKBENCH_LABEL_CLASS}>Qty</label>
               <Input
                 type="number"
                 inputMode="decimal"
-                value={item.quantity}
+                value={formatNumberInputValue(item.quantity)}
                 min={0}
                 step="any"
-                onChange={(e) => onChange({ quantity: Number(e.target.value || 1) })}
-                disabled={item.excluded}
-                className="h-12 text-base"
+                onChange={(e) => onChange({ quantity: parseNumberInputChange(e.target.value) })}
+                className={WORKBENCH_INPUT_CLASS}
               />
             </div>
-
-            {/* Unit price */}
             <div>
-              <label className="mb-1 block text-xs text-zinc-400">Unit Price (inc. GST) $</label>
+              <label className={WORKBENCH_LABEL_CLASS}>$ inc GST</label>
               <Input
                 type="number"
                 inputMode="decimal"
-                value={item.unitPriceIncGst}
+                value={formatNumberInputValue(item.unitPriceIncGst)}
                 min={0}
                 step="0.01"
-                onChange={(e) => onChange({ unitPriceIncGst: Number(e.target.value || 0) })}
-                disabled={item.excluded}
-                className="h-12 text-base"
+                onChange={(e) => onChange({ unitPriceIncGst: parseNumberInputChange(e.target.value) })}
+                className={WORKBENCH_INPUT_CLASS}
               />
             </div>
+            <div className="col-span-2 sm:col-span-1">
+              <label className={WORKBENCH_LABEL_CLASS}>Job</label>
+              <select
+                value={item.targetJobId}
+                onChange={(e) => onChange({ targetJobId: e.target.value })}
+                className="h-8 w-full cursor-pointer rounded-md border border-[#C3C6D4] bg-white px-2 text-xs text-[#323338] transition-all focus:border-[#0073EA] focus:ring-1 focus:ring-[#0073EA] focus:outline-none"
+              >
+                {jobOptions.map((job) => (
+                  <option key={job.id} value={job.id}>
+                    {job.id === currentJobId && job.title !== "Current Job"
+                      ? `${job.title} (current)`
+                      : job.title}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
-
-          {/* Job selector — large touch targets */}
-          <div>
-            <label className="mb-1 block text-xs text-zinc-400">Attribute to Job</label>
-            <select
-              value={item.targetJobId}
-              onChange={(e) => onChange({ targetJobId: e.target.value })}
-              disabled={item.excluded}
-              className="h-12 w-full cursor-pointer rounded-lg border border-zinc-600 bg-zinc-900 px-3 text-base text-zinc-100 focus:border-zinc-400 focus:outline-none disabled:opacity-50"
-            >
-              {jobOptions.map((job) => (
-                <option key={job.id} value={job.id}>
-                  {job.id === currentJobId && job.title !== "Current Job"
-                    ? `${job.title} (Current)`
-                    : job.title}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* Exclude label */}
-          <label
-            htmlFor={`exclude-${item.tempId}`}
-            className="flex cursor-pointer items-center gap-2 text-sm text-zinc-400"
-          >
-            <span className={item.excluded ? "line-through" : ""}>
-              {item.excluded ? "Excluded from invoice" : "Exclude from invoice"}
-            </span>
-          </label>
         </div>
 
-        {/* Remove button */}
         <button
+          type="button"
           onClick={onRemove}
-          className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200"
+          className="mt-5 flex shrink-0 items-center justify-center self-start rounded-md p-1.5 text-[#C3C6D4] transition-colors duration-150 hover:bg-[#FCECEE] hover:text-[#E2445C] sm:mt-6"
           aria-label="Remove item"
         >
           ✕

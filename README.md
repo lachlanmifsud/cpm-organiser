@@ -1,36 +1,54 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# The Builder's Ledger
 
-## Getting Started
+Professional admin and invoicing app for a self-employed residential builder.
 
-First, run the development server:
+## Stack
+
+- Next.js (App Router) + TypeScript
+- Tailwind CSS v4 + shadcn/ui
+- Firebase (Auth, Firestore, Storage)
+- TanStack Query
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+npm install
+```
+
+2. Create local env file:
+
+```bash
+cp .env.example .env.local
+```
+
+3. Add Firebase project values to `.env.local`.
+
+4. Start development server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Firebase Files
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `src/lib/firebase/config.ts` validates and exposes Firebase env config.
+- `src/lib/firebase/client.ts` initializes app, auth, firestore, and storage.
+- `src/lib/firebase/collections.ts` centralizes collection name constants.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Core Schema Types
 
-## Learn More
+All core domain types are defined in `src/types/database.ts`, including:
 
-To learn more about Next.js, take a look at the following resources:
+- Client (billing/site addresses + school fields like PO defaults)
+- Job (workflow state, files, quote/invoice links, duplicate source tracking)
+- Quote and Invoice (quote-to-invoice conversion support)
+- LineItem (labor, materials, variations, credits, returns)
+- Receipt extraction item allocations for splitting costs across jobs
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Current UI Scaffold
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Dashboard shell in `src/app/page.tsx`
+- Active Jobs table with payment status indicator
+- Desktop-first, high-contrast layout for admin workflows

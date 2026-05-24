@@ -1,0 +1,43 @@
+{
+  "functions": {
+    "source": "functions"
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "hosting": {
+    "public": "out",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/api/extract-receipt",
+        "function": "extractReceiptHttp"
+      },
+      {
+        "source": "/api/generate-template",
+        "function": "generateTemplateHttp"
+      },
+      {
+        "source": "/api/generate-document-body",
+        "function": "generateDocumentBodyHttp"
+      },
+      {
+        "source": "/api/refine-document-payload",
+        "function": "refineDocumentPayloadHttp"
+      },
+      {
+        "source": "/jobs/**",
+        "destination": "/jobs/placeholder.html"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}

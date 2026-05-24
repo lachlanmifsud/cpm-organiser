@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(data) {
+      return isSignedIn() && data.createdByUid == request.auth.uid;
+    }
+
+    match /jobs/{jobId} {
+      allow create: if isSignedIn() && request.resource.data.createdByUid == request.auth.uid;
+      allow read, update, delete: if isOwner(resource.data);
+
+      match /documents/{documentId} {
+        allow create: if isSignedIn() && request.resource.data.createdByUid == request.auth.uid;
+        allow read, update, delete: if isOwner(resource.data);
+      }
+    }
+
+    match /lineItems/{lineItemId} {
+      allow create: if isSignedIn() && request.resource.data.createdByUid == request.auth.uid;
+      allow read, update, delete: if isOwner(resource.data);
+    }
+
+    match /clients/{clientId} {
+      allow create: if isSignedIn() && request.resource.data.createdByUid == request.auth.uid;
+      allow read, update, delete: if isOwner(resource.data);
+    }
+
+    match /receipts/{fileId} {
+      allow create: if isSignedIn() && request.resource.data.createdByUid == request.auth.uid;
+      allow read, update, delete: if isOwner(resource.data);
+    }
+
+    match /userSettings/{userId} {
+      // Doc id is the owning uid. Allow get on missing docs (empty resource.data would fail isOwner).
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId && request.resource.data.createdByUid == request.auth.uid;
+      // Updates must keep createdByUid; allow legacy docs that predate createdByUid once path matches uid.
+      allow update: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.createdByUid == request.auth.uid
+        && (resource.data.createdByUid == request.auth.uid || !("createdByUid" in resource.data));
+      allow delete: if isSignedIn()
+        && request.auth.uid == userId
+        && (resource.data.createdByUid == request.auth.uid || !("createdByUid" in resource.data));
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

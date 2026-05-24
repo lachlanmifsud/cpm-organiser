@@ -1,165 +1,168 @@
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
-import { GoogleGenerativeAI, HarmBlockThreshold, HarmCategory, SchemaType } from "@google/generative-ai";
+import type { ExtractedReceiptItem, ExtractedReceiptMeta } from "@/lib/ai/extract-receipt-client";
 
-const SYSTEM_INSTRUCTION = `You are an expert line-item extraction engine for an industrial trade invoicing application. Analyze the provided tax invoice or supplier receipt. Extract every single physical material/product line item purchased. Ignore company overhead, credit card processing fees, loyalty rewards adjustments, and store metadata. Extract exactly what was bought, the volume, the individual item unit price, and the total line item cost.`;
-const MODEL_NAME = "gemini-2.5-flash";
+const allowedMimeTypes = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+  "image/heif",
+]);
 
-const receiptSchema = {
-  type: SchemaType.OBJECT,
-  properties: {
-    items: {
-      type: SchemaType.ARRAY,
-      items: {
-        type: SchemaType.OBJECT,
-        properties: {
-          description: { type: SchemaType.STRING },
-          quantity: { type: SchemaType.INTEGER, minimum: 1 },
-          unitPriceCents: { type: SchemaType.INTEGER, minimum: 0 },
-          subtotalCents: { type: SchemaType.INTEGER, minimum: 0 },
-        },
-        required: ["description", "quantity", "unitPriceCents", "subtotalCents"] as string[],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["items"] as string[],
-  additionalProperties: false,
-} as const;
+const prompt = `You are parsing a retail / trade receipt image (trade / hardware store style).
 
-async function bufferToBase64(buffer: ArrayBuffer) {
-  return Buffer.from(buffer).toString("base64");
+Return ONLY valid JSON (no markdown) with this exact shape:
+{"vendorName":"string","receiptDate":"YYYY-MM-DD","totalGstCents":number|null,"items":[{"description":"string","rawDescription":"string","quantity":number,"unitPriceCents":number,"subtotalCents":number}]}
+
+Root fields (header / totals):
+- vendorName: business or store name from the receipt header or letterhead. Use empty string if illegible.
+- receiptDate: transaction date as YYYY-MM-DD when clearly visible; otherwise empty string.
+- totalGstCents: total GST or tax amount for the sale in whole integer cents (AUD). Use the printed GST/tax total line (not the grand total inc-GST). Use null only when no separate GST/tax total exists on the receipt.
+
+For every product line item in "items", output:
+1) "description" — a short, professional, human-readable product title. Strip barcodes (EAN/UPC), internal SKU codes, and noisy tokens unless they are essential to identify the product. Expand common abbreviations (e.g. BLK → Black) only when obvious from context. Do not invent model numbers not visible on the line.
+2) "rawDescription" — the exact literal line text as printed on the receipt for that row (include barcodes, codes, and abbreviations exactly as shown).
+
+Also per line: quantity, unit price in cents (integer), line subtotal in cents (integer).
+
+Rules:
+- All money fields must be whole integers in cents (AUD).
+- If quantity is missing on the receipt, use 1.
+- If unit price is missing but line total and quantity exist, derive unitPriceCents = round(subtotalCents / quantity).
+- Skip non-product rows (payment lines, totals-only, GST summary as a single tax line is not a product row, loyalty) unless they are clearly a purchasable SKU line.
+- rawDescription must be non-empty whenever a line is included; copy it faithfully from the receipt image for that line.
+`;
+
+function num(v: unknown, fallback: number): number {
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return v;
+  }
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
+    return Number(v);
+  }
+  return fallback;
 }
 
-async function parseImagePayload(request: Request) {
-  const contentType = request.headers.get("content-type") || "";
+function str(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
 
-  if (contentType.includes("application/json")) {
-    const body = await request.json();
-
-    if (typeof body.imageBase64 === "string" && typeof body.mimeType === "string") {
-      return {
-        imageBase64: body.imageBase64,
-        mimeType: body.mimeType,
-      };
-    }
-
-    if (typeof body.imageUrl === "string" && typeof body.mimeType === "string") {
-      const imageResponse = await fetch(body.imageUrl);
-      if (!imageResponse.ok) {
-        throw new Error("Unable to fetch image from imageUrl.");
-      }
-      const arrayBuffer = await imageResponse.arrayBuffer();
-      return {
-        imageBase64: await bufferToBase64(arrayBuffer),
-        mimeType: body.mimeType,
-      };
-    }
-
-    throw new Error("JSON request body must include imageBase64 and mimeType, or imageUrl and mimeType.");
+function normalizeExtractedItems(items: unknown): ExtractedReceiptItem[] | null {
+  if (!Array.isArray(items)) {
+    return null;
   }
-
-  if (contentType.includes("multipart/form-data")) {
-    const formData = await request.formData();
-    const file = formData.get("image");
-
-    if (file instanceof File) {
-      const arrayBuffer = await file.arrayBuffer();
-      return {
-        imageBase64: await bufferToBase64(arrayBuffer),
-        mimeType: file.type || "application/octet-stream",
-      };
+  const out: ExtractedReceiptItem[] = [];
+  for (const row of items) {
+    if (!row || typeof row !== "object") {
+      continue;
     }
-
-    const imageBase64 = formData.get("imageBase64");
-    const mimeType = formData.get("mimeType");
-
-    if (typeof imageBase64 === "string" && typeof mimeType === "string") {
-      return {
-        imageBase64,
-        mimeType,
-      };
+    const r = row as Record<string, unknown>;
+    const description = str(r.description);
+    const rawDescription = str(r.rawDescription) || description;
+    const title = description || rawDescription;
+    if (!title) {
+      continue;
     }
-
-    throw new Error("FormData request must include an image file or imageBase64 with mimeType.");
+    const qty = num(r.quantity, 1);
+    const unitPriceCents = Math.round(num(r.unitPriceCents, 0));
+    const subtotalCents = Math.round(num(r.subtotalCents, 0));
+    out.push({
+      description: description || rawDescription,
+      rawDescription: rawDescription || description,
+      quantity: qty > 0 ? qty : 1,
+      unitPriceCents,
+      subtotalCents,
+    });
   }
+  return out;
+}
 
-  throw new Error("Unsupported content type. Send multipart/form-data or application/json.");
+function normalizeReceiptMeta(root: Record<string, unknown>): ExtractedReceiptMeta {
+  if (!root || Array.isArray(root)) {
+    return { vendorName: null, receiptDate: null, totalGstCents: null };
+  }
+  const vendorName = str(root.vendorName) || null;
+  const receiptDate = str(root.receiptDate) || null;
+  let totalGstCents: number | null = null;
+  const g = root.totalGstCents;
+  if (g !== null && g !== undefined && g !== "") {
+    const n = Math.round(num(g as unknown, NaN));
+    if (Number.isFinite(n)) {
+      totalGstCents = n;
+    }
+  }
+  return { vendorName, receiptDate, totalGstCents };
 }
 
 export async function POST(request: Request) {
   const apiKey = process.env.GEMINI_API_KEY;
-
   if (!apiKey) {
     return NextResponse.json(
-      { error: "Server configuration error: GEMINI_API_KEY is not configured." },
+      { error: "Server misconfiguration: GEMINI_API_KEY is not set." },
       { status: 500 },
     );
   }
 
-  let payload;
-
+  let form: FormData;
   try {
-    payload = await parseImagePayload(request);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid request payload.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    form = await request.formData();
+  } catch {
+    return NextResponse.json({ error: "Expected multipart/form-data body." }, { status: 400 });
   }
 
+  const file = form.get("file");
+  if (!(file instanceof Blob) || file.size === 0) {
+    return NextResponse.json({ error: 'Missing or empty "file" field.' }, { status: 400 });
+  }
+
+  const mimeFromField = form.get("mimeType");
+  const declaredMime =
+    typeof mimeFromField === "string" && allowedMimeTypes.has(mimeFromField) ? mimeFromField : "";
+
+  const mimeType =
+    file.type && allowedMimeTypes.has(file.type) ? file.type : declaredMime;
+  if (!mimeType) {
+    return NextResponse.json(
+      { error: "Unsupported image type. Use JPEG, PNG, WebP, HEIC, or HEIF." },
+      { status: 400 },
+    );
+  }
+
+  const arrayBuffer = await file.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString("base64");
+
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: MODEL_NAME,
-    systemInstruction: SYSTEM_INSTRUCTION,
-    safetySettings: [
-      {
-        category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold: HarmBlockThreshold.BLOCK_NONE,
-      },
-    ],
-  });
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
   try {
-    const result = await model.generateContent(
+    const result = await model.generateContent([
+      prompt,
       {
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                inlineData: {
-                  mimeType: payload.imageBase64 ? payload.mimeType : "application/octet-stream",
-                  data: payload.imageBase64,
-                },
-              },
-            ],
-          },
-          {
-            role: "user",
-            parts: [
-              {
-                text: "Extract the receipt line items and return only valid JSON using the provided schema.",
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: receiptSchema,
-          temperature: 0,
-          maxOutputTokens: 1200,
+        inlineData: {
+          mimeType,
+          data: base64,
         },
       },
-    );
+    ]);
 
-    const rawResponse = result.response.text().trim();
-    const parsed = JSON.parse(rawResponse);
-
-    if (!Array.isArray(parsed?.items)) {
-      throw new Error("AI response did not return a valid items array.");
+    const text = result.response.text().trim();
+    let jsonText = text;
+    if (jsonText.startsWith("```")) {
+      jsonText = jsonText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
     }
 
-    return NextResponse.json(parsed);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Receipt extraction failed.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    const items = normalizeExtractedItems(parsed.items);
+    if (!items) {
+      return NextResponse.json({ error: "Model returned an invalid JSON shape." }, { status: 502 });
+    }
+
+    const meta = normalizeReceiptMeta(parsed);
+    return NextResponse.json({ ...meta, items });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Gemini request failed.";
+    console.error("[extract-receipt]", e);
+    return NextResponse.json({ error: message }, { status: 502 });
   }
 }
